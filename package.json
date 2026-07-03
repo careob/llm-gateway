@@ -30,5 +30,14 @@
   },
   "files": ["dist", "README.md"],
   "keywords": ["llm", "gateway", "openai", "anthropic", "key-rotation", "rate-limit", "express"],
-  "license": "MIT"
+  "license": "MIT",
+  "author": "Careob <gaurav@careob.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/careob/llm-gateway.git"
+  },
+  "homepage": "https://github.com/careob/llm-gateway#readme",
+  "bugs": {
+    "url": "https://github.com/careob/llm-gateway/issues"
+  }
 }
