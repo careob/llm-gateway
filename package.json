@@ -1,6 +1,6 @@
 {
   "name": "@careob/llm-gateway",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lightweight LLM gateway with multi-key rotation, rate-limit handling, provider failover, and spend tracking for Node.js/Express apps",
   "type": "module",
   "main": "dist/index.js",
