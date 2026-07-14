@@ -6,7 +6,7 @@ import {
   findProviderForModel,
   buildRequest,
   parseResponse,
-  parseStreamChunk,
+  createStreamParser,
   estimateCost,
 } from './registry.js';
 import type { ProviderDef } from './registry.js';
@@ -59,12 +59,14 @@ export class LLMGateway {
     const model = request.model ?? this.config.defaultModel;
     if (!model) throw new GatewayError('No model specified and no defaultModel configured', 'CONFIG_ERROR');
 
-    const fullRequest = { ...request, model, stream: false };
-    const providers = this.resolveProviders(fullRequest);
+    const targets = this.resolveTargets({ ...request, model });
     let lastError: Error | null = null;
     let attempt = 0;
 
-    for (const providerDef of providers) {
+    for (const target of targets) {
+      const providerDef = target.provider;
+      const targetRequest = { ...request, model: target.model, stream: false };
+
       for (let retry = 0; retry < this.config.maxRetries; retry++) {
         const key = this.pool.getNextKey(providerDef.id);
         if (!key) break;
@@ -74,7 +76,7 @@ export class LLMGateway {
         const start = Date.now();
 
         try {
-          const { url, init } = buildRequest(providerDef, fullRequest, key.key);
+          const { url, init } = buildRequest(providerDef, targetRequest, key.key);
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
           init.signal = controller.signal;
@@ -83,8 +85,8 @@ export class LLMGateway {
           clearTimeout(timeout);
 
           if (res.status === 429) {
-            this.pool.recordRateLimit(key);
-            this.logUsage(requestId, providerDef.id, key, model, start, 'rate_limited', undefined, 'Rate limited');
+            this.pool.recordRateLimit(key, parseRetryAfterMs(res));
+            this.logUsage(requestId, providerDef.id, key, target.model, start, 'rate_limited', undefined, 'Rate limited');
             continue;
           }
 
@@ -92,7 +94,7 @@ export class LLMGateway {
             const errorText = await res.text().catch(() => `HTTP ${res.status}`);
             this.pool.recordError(key);
             lastError = new GatewayError(`${providerDef.label}: ${errorText}`, 'PROVIDER_ERROR', res.status);
-            this.logUsage(requestId, providerDef.id, key, model, start, 'error', undefined, errorText);
+            this.logUsage(requestId, providerDef.id, key, target.model, start, 'error', undefined, errorText);
             continue;
           }
 
@@ -106,7 +108,7 @@ export class LLMGateway {
           };
 
           this.pool.recordSuccess(key, parsed.usage.total_tokens);
-          this.logUsage(requestId, providerDef.id, key, model, start, 'success', parsed.usage, undefined, request.metadata);
+          this.logUsage(requestId, providerDef.id, key, target.model, start, 'success', parsed.usage, undefined, request.metadata);
 
           return parsed;
         } catch (err) {
@@ -117,7 +119,7 @@ export class LLMGateway {
           } else {
             lastError = err instanceof GatewayError ? err : new GatewayError(`${providerDef.label}: ${msg}`, 'NETWORK_ERROR');
           }
-          this.logUsage(requestId, providerDef.id, key, model, start, 'error', undefined, msg);
+          this.logUsage(requestId, providerDef.id, key, target.model, start, 'error', undefined, msg);
         }
       }
 
@@ -131,14 +133,12 @@ export class LLMGateway {
     const model = request.model ?? this.config.defaultModel;
     if (!model) throw new GatewayError('No model specified and no defaultModel configured', 'CONFIG_ERROR');
 
-    const fullRequest = { ...request, model, stream: true };
-    const providers = this.resolveProviders(fullRequest);
+    const targets = this.resolveTargets({ ...request, model });
     let lastError: Error | null = null;
 
-    for (const providerDef of providers) {
-      if (providerDef.format !== 'openai') {
-        continue;
-      }
+    for (const target of targets) {
+      const providerDef = target.provider;
+      const targetRequest = { ...request, model: target.model, stream: true };
 
       for (let retry = 0; retry < this.config.maxRetries; retry++) {
         const key = this.pool.getNextKey(providerDef.id);
@@ -146,9 +146,10 @@ export class LLMGateway {
 
         const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const start = Date.now();
+        let yieldedAny = false;
 
         try {
-          const { url, init } = buildRequest(providerDef, fullRequest, key.key);
+          const { url, init } = buildRequest(providerDef, targetRequest, key.key);
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs * 3);
           init.signal = controller.signal;
@@ -157,22 +158,25 @@ export class LLMGateway {
           clearTimeout(timeout);
 
           if (res.status === 429) {
-            this.pool.recordRateLimit(key);
+            this.pool.recordRateLimit(key, parseRetryAfterMs(res));
+            this.logUsage(requestId, providerDef.id, key, target.model, start, 'rate_limited', undefined, 'Rate limited');
             continue;
           }
 
           if (!res.ok) {
             this.pool.recordError(key);
             lastError = new GatewayError(`${providerDef.label}: HTTP ${res.status}`, 'PROVIDER_ERROR', res.status);
+            this.logUsage(requestId, providerDef.id, key, target.model, start, 'error', undefined, `HTTP ${res.status}`);
             continue;
           }
 
           if (!res.body) throw new GatewayError('No response body for stream', 'PROVIDER_ERROR');
 
+          const parseLine = createStreamParser(providerDef);
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
-          let totalTokens = 0;
+          let usage: TokenUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
           try {
             while (true) {
@@ -184,9 +188,10 @@ export class LLMGateway {
               buffer = lines.pop() ?? '';
 
               for (const line of lines) {
-                const chunk = parseStreamChunk(line);
+                const chunk = parseLine(line);
                 if (chunk) {
-                  if (chunk.usage) totalTokens = chunk.usage.total_tokens;
+                  if (chunk.usage) usage = chunk.usage;
+                  yieldedAny = true;
                   yield chunk;
                 }
               }
@@ -195,10 +200,8 @@ export class LLMGateway {
             reader.releaseLock();
           }
 
-          this.pool.recordSuccess(key, totalTokens);
-          this.logUsage(requestId, providerDef.id, key, model, start, 'success', {
-            prompt_tokens: 0, completion_tokens: 0, total_tokens: totalTokens,
-          }, undefined, request.metadata);
+          this.pool.recordSuccess(key, usage.total_tokens);
+          this.logUsage(requestId, providerDef.id, key, target.model, start, 'success', usage, undefined, request.metadata);
 
           return;
         } catch (err) {
@@ -208,8 +211,13 @@ export class LLMGateway {
             `${providerDef.label}: ${err instanceof Error ? err.message : String(err)}`,
             'NETWORK_ERROR',
           );
+          this.logUsage(requestId, providerDef.id, key, target.model, start, 'error', undefined, lastError.message);
+          // Chunks already reached the consumer — retrying would duplicate content
+          if (yieldedAny) throw lastError;
         }
       }
+
+      this.config.onAllKeysExhausted?.(providerDef.id);
     }
 
     throw lastError ?? new GatewayError('All providers exhausted for streaming', 'ALL_EXHAUSTED');
@@ -257,25 +265,43 @@ export class LLMGateway {
     }
   }
 
-  private resolveProviders(request: ChatRequest): ProviderDef[] {
+  /**
+   * Resolves the ordered list of (provider, model) pairs to try.
+   * The primary model comes first; fallback models (per-request, or from
+   * config.fallbackModels) follow, each routed to its own provider so a
+   * failover never sends a model name to a provider that doesn't serve it.
+   */
+  private resolveTargets(request: ChatRequest): Array<{ provider: ProviderDef; model: string }> {
+    const model = request.model!;
+
     if (request.provider) {
       const def = PROVIDERS[request.provider];
       if (!def) throw new GatewayError(`Provider "${request.provider}" not found`, 'CONFIG_ERROR');
-      return [def];
+      return [{ provider: def, model }];
     }
 
-    const registeredProviders = this.pool.getProviders();
-    const modelProvider = findProviderForModel(request.model!);
+    const registered = new Set(this.pool.getProviders());
+    const modelChain = [model, ...(request.fallbackModels ?? this.config.fallbackModels?.[model] ?? [])];
+    const targets: Array<{ provider: ProviderDef; model: string }> = [];
+    const seen = new Set<string>();
 
-    if (modelProvider && registeredProviders.includes(modelProvider.id)) {
-      const others = registeredProviders
-        .filter((id) => id !== modelProvider.id)
-        .map((id) => PROVIDERS[id])
-        .filter(Boolean) as ProviderDef[];
-      return [modelProvider, ...others];
+    for (const m of modelChain) {
+      const def = findProviderForModel(m);
+      if (def && registered.has(def.id) && !seen.has(`${def.id}:${m}`)) {
+        seen.add(`${def.id}:${m}`);
+        targets.push({ provider: def, model: m });
+      }
     }
 
-    return registeredProviders.map((id) => PROVIDERS[id]).filter(Boolean) as ProviderDef[];
+    if (targets.length === 0) {
+      // Model not in the registry (custom/self-hosted name): try it on every registered provider
+      for (const id of registered) {
+        const def = PROVIDERS[id];
+        if (def) targets.push({ provider: def, model });
+      }
+    }
+
+    return targets;
   }
 
   private logUsage(
@@ -314,6 +340,29 @@ export class LLMGateway {
       // spend tracking should never crash the gateway
     }
   }
+}
+
+/**
+ * Reads the Retry-After response header (seconds or HTTP date) so a
+ * rate-limited key cools down exactly as long as the provider asked,
+ * instead of the blanket cooldownMs. Capped at 5 minutes.
+ */
+function parseRetryAfterMs(res: { headers: { get(name: string): string | null } }): number | undefined {
+  const header = res.headers.get('retry-after');
+  if (!header) return undefined;
+
+  const seconds = Number(header);
+  let ms: number;
+  if (Number.isFinite(seconds)) {
+    ms = seconds * 1000;
+  } else {
+    const date = Date.parse(header);
+    if (Number.isNaN(date)) return undefined;
+    ms = date - Date.now();
+  }
+
+  if (ms <= 0) return undefined;
+  return Math.min(ms, 5 * 60_000);
 }
 
 export type GatewayErrorCode =

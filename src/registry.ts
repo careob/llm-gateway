@@ -285,9 +285,9 @@ export function buildRequest(
       body: buildAnthropicBody(request),
     }),
     gemini: () => {
-      const endpoint = request.stream ? 'streamGenerateContent' : 'generateContent';
+      const endpoint = request.stream ? 'streamGenerateContent?alt=sse&' : 'generateContent?';
       return {
-        url: `${provider.baseUrl}/models/${request.model}:${endpoint}?key=${apiKey}`,
+        url: `${provider.baseUrl}/models/${request.model}:${endpoint}key=${apiKey}`,
         body: buildGeminiBody(request),
       };
     },
@@ -310,10 +310,8 @@ export function parseResponse(provider: ProviderDef, data: unknown): ChatRespons
 }
 
 export function parseStreamChunk(line: string): StreamChunkResult | null {
-  const trimmed = line.trim();
-  if (!trimmed.startsWith('data: ')) return null;
-  const payload = trimmed.slice(6);
-  if (payload === '[DONE]') return null;
+  const payload = extractSseData(line);
+  if (!payload) return null;
   try {
     return JSON.parse(payload) as StreamChunkResult;
   } catch {
@@ -321,7 +319,129 @@ export function parseStreamChunk(line: string): StreamChunkResult | null {
   }
 }
 
-type StreamChunkResult = import('./types.js').StreamChunk & { usage?: TokenUsage };
+export type StreamChunkResult = import('./types.js').StreamChunk & { usage?: TokenUsage };
+
+/**
+ * Returns a (possibly stateful) parser that turns one SSE line from the
+ * provider into a normalized OpenAI-style stream chunk, or null if the
+ * line carries no content. Create a fresh parser per stream.
+ */
+export function createStreamParser(provider: ProviderDef): (line: string) => StreamChunkResult | null {
+  const FACTORIES: Record<ApiFormat, () => (line: string) => StreamChunkResult | null> = {
+    openai: () => parseStreamChunk,
+    anthropic: createAnthropicStreamParser,
+    gemini: createGeminiStreamParser,
+  };
+  return FACTORIES[provider.format]();
+}
+
+function extractSseData(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('data:')) return null;
+  const payload = trimmed.slice(5).trim();
+  if (!payload || payload === '[DONE]') return null;
+  return payload;
+}
+
+function createAnthropicStreamParser(): (line: string) => StreamChunkResult | null {
+  let id = '';
+  let model = '';
+  let promptTokens = 0;
+  let completionTokens = 0;
+
+  return (line) => {
+    const payload = extractSseData(line);
+    if (!payload) return null;
+
+    let event: {
+      type?: string;
+      message?: { id?: string; model?: string; usage?: { input_tokens?: number } };
+      delta?: { text?: string; stop_reason?: string };
+      usage?: { output_tokens?: number };
+    };
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+
+    const chunk = (delta: Partial<ChatMessage>, finishReason: string | null): StreamChunkResult => ({
+      id,
+      object: 'chat.completion.chunk',
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    });
+
+    switch (event.type) {
+      case 'message_start':
+        id = event.message?.id ?? id;
+        model = event.message?.model ?? model;
+        promptTokens = event.message?.usage?.input_tokens ?? 0;
+        return chunk({ role: 'assistant', content: '' }, null);
+      case 'content_block_delta':
+        if (!event.delta?.text) return null;
+        return chunk({ content: event.delta.text }, null);
+      case 'message_delta': {
+        completionTokens = event.usage?.output_tokens ?? completionTokens;
+        const stop = event.delta?.stop_reason;
+        const final = chunk({}, stop === 'end_turn' ? 'stop' : stop ?? null);
+        final.usage = {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        };
+        return final;
+      }
+      default:
+        return null;
+    }
+  };
+}
+
+function createGeminiStreamParser(): (line: string) => StreamChunkResult | null {
+  const id = `gemini-${Date.now()}`;
+
+  return (line) => {
+    const payload = extractSseData(line);
+    if (!payload) return null;
+
+    let event: {
+      modelVersion?: string;
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>;
+      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
+    };
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+
+    const candidate = event.candidates?.[0];
+    const text = candidate?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+    const finish = candidate?.finishReason;
+    if (!text && !finish) return null;
+
+    const result: StreamChunkResult = {
+      id,
+      object: 'chat.completion.chunk',
+      model: event.modelVersion ?? 'gemini',
+      choices: [{
+        index: 0,
+        delta: text ? { content: text } : {},
+        finish_reason: finish ? (finish === 'STOP' ? 'stop' : finish) : null,
+      }],
+    };
+    const meta = event.usageMetadata;
+    if (meta) {
+      result.usage = {
+        prompt_tokens: meta.promptTokenCount ?? 0,
+        completion_tokens: meta.candidatesTokenCount ?? 0,
+        total_tokens: meta.totalTokenCount ?? 0,
+      };
+    }
+    return result;
+  };
+}
 
 // ─── Cost Estimation ──────────────────────────────────────────
 

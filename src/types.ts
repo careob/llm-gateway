@@ -17,6 +17,13 @@ export interface GatewayConfig {
   keys: Array<string | KeyInput>;
   /** Default model to use when not specified in request */
   defaultModel?: string;
+  /**
+   * Cross-provider fallback chains, keyed by primary model.
+   * e.g. { 'gpt-4o': ['claude-sonnet-4-20250514', 'gemini-2.5-flash'] }
+   * When all keys for the primary model's provider are exhausted, the
+   * request is retried with the mapped models on their own providers.
+   */
+  fallbackModels?: Record<string, string[]>;
   /** Retries across keys before failing. Default: 3 */
   maxRetries?: number;
   /** Cooldown ms for a rate-limited key. Default: 60000 */
@@ -51,6 +58,8 @@ export interface ChatRequest {
   response_format?: unknown;
   /** Force a specific provider by name */
   provider?: string;
+  /** Ordered fallback models to try if this model's provider is exhausted. Overrides GatewayConfig.fallbackModels */
+  fallbackModels?: string[];
   /** Metadata for spend tracking */
   metadata?: Record<string, string>;
 }

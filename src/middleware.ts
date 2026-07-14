@@ -50,6 +50,7 @@ export function createExpressProxy(gateway: LLMGateway, options: ProxyOptions = 
       tool_choice: body.tool_choice,
       response_format: body.response_format,
       provider: body.provider,
+      fallbackModels: body.fallbackModels,
       metadata,
     };
 

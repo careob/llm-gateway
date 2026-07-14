@@ -61,8 +61,8 @@ export class KeyPool {
     key.totalRequests++;
   }
 
-  recordRateLimit(key: KeyState): void {
-    key.cooldownUntil = Date.now() + this.cooldownMs;
+  recordRateLimit(key: KeyState, cooldownOverrideMs?: number): void {
+    key.cooldownUntil = Date.now() + (cooldownOverrideMs ?? this.cooldownMs);
     key.healthy = false;
     key.totalErrors++;
   }

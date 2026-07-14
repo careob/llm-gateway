@@ -9,8 +9,9 @@ export {
   discoverKeysFromEnv,
   findProviderForModel,
   estimateCost,
+  createStreamParser,
 } from './registry.js';
-export type { ProviderDef, ApiFormat, AuthStyle } from './registry.js';
+export type { ProviderDef, ApiFormat, AuthStyle, StreamChunkResult } from './registry.js';
 export type {
   KeyInput,
   GatewayConfig,

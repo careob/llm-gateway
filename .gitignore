@@ -22,3 +22,7 @@ npm-debug.log*
 
 # Coverage
 coverage/
+
+# Internal planning / diagrams (not for the repo)
+FUTURE_SCOPE.md
+architecture.drawio
